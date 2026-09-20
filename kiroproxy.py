@@ -563,6 +563,7 @@ def build_payload(body, names, conversation_id):
         payload["conversationState"]["history"] = history
 
     trim_payload(payload)
+    prune_orphan_tool_results(payload)
     return payload, model_id
 
 
@@ -578,6 +579,72 @@ def trim_payload(payload):
             state.pop("history", None)
     vlog("payload %d bytes, %d history entries"
          % (len(json.dumps(state).encode()), len(state.get("history", []))))
+
+
+def _tool_use_ids(entry):
+    """toolUseIds offered by an assistant history entry."""
+    if not isinstance(entry, dict):
+        return set()
+    msg = entry.get("assistantResponseMessage")
+    if not isinstance(msg, dict):
+        return set()
+    return {u.get("toolUseId") for u in msg.get("toolUses") or []
+            if isinstance(u, dict) and u.get("toolUseId")}
+
+
+def prune_orphan_tool_results(payload):
+    """Drop toolResults whose toolUse is no longer in the preceding message.
+
+    trim_payload() deletes the oldest history entries in pairs. History
+    alternates user/assistant, so a cut can remove the assistant entry that
+    issued a toolUse while keeping the user entry that answers it. Kiro then
+    rejects the whole request with TOOL_USE_RESULT_MISMATCH, and because the
+    trim is deterministic every retry reproduces it. Kiro scopes the match to
+    the immediately previous message, so that is the scope used here.
+    """
+    state = payload.get("conversationState") or {}
+    history = state.get("history") or []
+    dropped = 0
+
+    for i, entry in enumerate(history):
+        msg = entry.get("userInputMessage") if isinstance(entry, dict) else None
+        if not isinstance(msg, dict):
+            continue
+        context = msg.get("userInputMessageContext")
+        if not isinstance(context, dict) or not context.get("toolResults"):
+            continue
+        allowed = _tool_use_ids(history[i - 1]) if i else set()
+        kept = [r for r in context["toolResults"]
+                if isinstance(r, dict) and r.get("toolUseId") in allowed]
+        dropped += len(context["toolResults"]) - len(kept)
+        if kept:
+            context["toolResults"] = kept
+            continue
+        context.pop("toolResults", None)
+        if not context:
+            msg.pop("userInputMessageContext", None)
+        # An empty content is only safe while real tool output is attached.
+        if not msg.get("content"):
+            msg["content"] = "(earlier tool output trimmed)"
+
+    current = (state.get("currentMessage") or {}).get("userInputMessage")
+    if isinstance(current, dict):
+        context = current.get("userInputMessageContext")
+        if isinstance(context, dict) and context.get("toolResults"):
+            allowed = _tool_use_ids(history[-1]) if history else set()
+            kept = [r for r in context["toolResults"]
+                    if isinstance(r, dict) and r.get("toolUseId") in allowed]
+            dropped += len(context["toolResults"]) - len(kept)
+            if kept:
+                context["toolResults"] = kept
+            else:
+                context.pop("toolResults", None)
+                if not current.get("content"):
+                    current["content"] = "(earlier tool output trimmed)"
+
+    if dropped:
+        log("dropped %d orphaned tool result(s) after trim" % dropped)
+    return dropped
 
 
 # ----------------------------------------------------------------------------
