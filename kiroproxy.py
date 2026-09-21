@@ -75,6 +75,13 @@ KNOWN_MODELS = [
 DEFAULT_MODEL = os.environ.get("KIRO_DEFAULT_MODEL", "claude-opus-5")
 SMALL_MODEL = os.environ.get("KIRO_SMALL_MODEL", "claude-haiku-4.5")
 
+# Thinking. Kiro accepts additionalModelRequestFields.thinking.type in
+# ("adaptive", "disabled") and output_config.effort in
+# ("low", "medium", "high", "xhigh", "max"). Probed live 2026-09-21.
+THINKING_DEFAULT = os.environ.get("KIRO_THINKING", "adaptive")
+EFFORT_DEFAULT = os.environ.get("KIRO_EFFORT", "high")
+VALID_EFFORT = ("low", "medium", "high", "xhigh", "max")
+
 MAX_TOOL_NAME = 64
 MAX_PAYLOAD_BYTES = int(os.environ.get("KIRO_MAX_PAYLOAD_BYTES", "600000"))
 REQUEST_TIMEOUT = int(os.environ.get("KIRO_TIMEOUT", "600"))
@@ -82,8 +89,39 @@ REQUEST_TIMEOUT = int(os.environ.get("KIRO_TIMEOUT", "600"))
 VERBOSE = False
 
 
+LOG_FILE = os.environ.get(
+    "KIRO_LOG", os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy.log"))
+_log_fh = None
+
+
+def _log_target():
+    """Append to proxy.log regardless of how the process was launched.
+
+    The Windows launcher uses a hidden Start-Process with no redirection, so
+    anything written only to stderr is lost - including the trim warnings.
+    """
+    global _log_fh
+    if _log_fh is None and LOG_FILE:
+        try:
+            if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 4 << 20:
+                prev = os.path.splitext(LOG_FILE)[0] + ".prev.log"
+                os.replace(LOG_FILE, prev)
+            _log_fh = open(LOG_FILE, "a", encoding="utf-8")
+        except Exception:
+            _log_fh = False        # tried once, do not keep retrying
+    return _log_fh or None
+
+
 def log(*a):
-    print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
+    line = " ".join([time.strftime("%H:%M:%S")] + [str(x) for x in a])
+    print(line, file=sys.stderr, flush=True)
+    fh = _log_target()
+    if fh:
+        try:
+            fh.write(line + "\n")
+            fh.flush()
+        except Exception:
+            pass
 
 
 def vlog(*a):
@@ -413,6 +451,67 @@ def extract_images(content):
     return images
 
 
+def extract_reasoning(content):
+    """Pull a signed thinking block out of an assistant turn.
+
+    Claude Code hands back the thinking blocks it was given. Kiro accepts them
+    on assistantResponseMessage.reasoningContent as a single object - a list
+    there is a 400. Unsigned blocks are dropped: without the signature the
+    round-trip is worthless and Kiro keeps continuity itself anyway.
+    """
+    if not isinstance(content, list):
+        return None
+    text, signature = [], None
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "thinking":
+            continue
+        text.append(block.get("thinking") or "")
+        signature = block.get("signature") or signature
+    if not signature:
+        return None
+    return {"reasoningText": {"text": "".join(text), "signature": signature}}
+
+
+def model_request_fields(body):
+    """additionalModelRequestFields from what Claude Code asked for.
+
+    Claude Code sends `thinking` as {"type": "enabled", "budget_tokens": N}.
+    Kiro has no budget knob - it takes "adaptive" or "disabled" plus a coarse
+    effort level - so the budget is mapped onto an effort instead.
+    """
+    if THINKING_DEFAULT == "off":
+        return None
+
+    asked = body.get("thinking")
+    mode = THINKING_DEFAULT
+    effort = EFFORT_DEFAULT
+    if isinstance(asked, dict):
+        atype = asked.get("type")
+        if atype == "disabled":
+            mode = "disabled"
+        elif atype in ("enabled", "adaptive"):
+            mode = "adaptive"
+        budget = asked.get("budget_tokens")
+        if isinstance(budget, int):
+            # Claude Code's budget -> Kiro's nearest effort step.
+            for limit, level in ((4000, "low"), (10000, "medium"),
+                                 (24000, "high"), (48000, "xhigh")):
+                if budget <= limit:
+                    effort = level
+                    break
+            else:
+                effort = "max"
+
+    cfg = body.get("output_config")
+    if isinstance(cfg, dict) and cfg.get("effort") in VALID_EFFORT:
+        effort = cfg["effort"]
+
+    fields = {"thinking": {"type": mode}}
+    if effort in VALID_EFFORT:
+        fields["output_config"] = {"effort": effort}
+    return fields
+
+
 def extract_tool_uses(content, names):
     uses = []
     if not isinstance(content, list):
@@ -511,6 +610,9 @@ def build_payload(body, names, conversation_id):
             uses = extract_tool_uses(content, names) if tools else []
             if uses:
                 entry["toolUses"] = uses
+            reasoning = extract_reasoning(content)
+            if reasoning:
+                entry["reasoningContent"] = reasoning
             history.append({"assistantResponseMessage": entry})
 
     # Kiro history must be user/assistant pairs; a dangling user entry breaks it.
@@ -527,13 +629,6 @@ def build_payload(body, names, conversation_id):
                                                  "modelId": model_id,
                                                  "origin": "AI_EDITOR"}})
         current_text = "Continue."
-
-    if system_prompt:
-        if history and "userInputMessage" in history[0]:
-            first = history[0]["userInputMessage"]
-            first["content"] = system_prompt + "\n\n" + first["content"]
-        else:
-            current_text = system_prompt + "\n\n" + current_text
 
     context = {}
     current_results = []
@@ -554,6 +649,8 @@ def build_payload(body, names, conversation_id):
     if context:
         user_message["userInputMessageContext"] = context
 
+    fields = model_request_fields(body)
+
     payload = {"conversationState": {
         "chatTriggerType": "MANUAL",
         "conversationId": conversation_id,
@@ -561,24 +658,53 @@ def build_payload(body, names, conversation_id):
     }}
     if history:
         payload["conversationState"]["history"] = history
+    if fields:
+        payload["additionalModelRequestFields"] = fields
 
-    trim_payload(payload)
+    # The system prompt is injected only AFTER trimming. Kiro's API has no
+    # systemPrompt field (probed live: it 400s in every shape), so the prompt
+    # has to ride on the oldest user message - and trim_payload eats history
+    # from the front. Doing this before the trim silently deleted Claude Code's
+    # whole system prompt on every request over the size cap, which left Kiro's
+    # own "I am Kiro, built by AWS" persona answering. Reserve keeps it whole.
+    reserve = len(system_prompt.encode()) + 64 if system_prompt else 0
+    trim_payload(payload, reserve)
     prune_orphan_tool_results(payload)
+
+    if system_prompt:
+        state = payload["conversationState"]
+        hist = state.get("history") or []
+        if hist and "userInputMessage" in hist[0]:
+            first = hist[0]["userInputMessage"]
+            first["content"] = system_prompt + "\n\n" + first["content"]
+        else:
+            cur = state["currentMessage"]["userInputMessage"]
+            cur["content"] = system_prompt + "\n\n" + cur["content"]
     return payload, model_id
 
 
-def trim_payload(payload):
-    """Drop the oldest history pairs until the request fits Kiro's limit."""
+def trim_payload(payload, reserve=0):
+    """Drop the oldest history pairs until the request fits Kiro's limit.
+
+    `reserve` holds back room for bytes added after this runs (the system
+    prompt), so injecting it later cannot push the request back over the cap.
+    """
     state = payload["conversationState"]
-    while len(json.dumps(state).encode()) > MAX_PAYLOAD_BYTES:
+    budget = MAX_PAYLOAD_BYTES - reserve
+    before = len(state.get("history", []))
+    while len(json.dumps(state).encode()) > budget:
         history = state.get("history")
         if not history or len(history) < 2:
             break
         del history[0:2]
         if not history:
             state.pop("history", None)
+    after = len(state.get("history", []))
+    if after < before:
+        log("TRIMMED %d of %d history entries to fit %d bytes - the oldest "
+            "turns are gone from this request" % (before - after, before, budget))
     vlog("payload %d bytes, %d history entries"
-         % (len(json.dumps(state).encode()), len(state.get("history", []))))
+         % (len(json.dumps(state).encode()), after))
 
 
 def _tool_use_ids(entry):
@@ -754,8 +880,13 @@ class EventStreamDecoder:
                     if depth == 0:
                         try:
                             data = json.loads(text[start:i + 1])
-                            kind = ("assistantResponseEvent" if "content" in data
-                                    else "toolUseEvent")
+                            if "content" in data:
+                                kind = "assistantResponseEvent"
+                            elif "signature" in data or (
+                                    "text" in data and "toolUseId" not in data):
+                                kind = "reasoningContentEvent"
+                            else:
+                                kind = "toolUseEvent"
                             events.append((kind, data))
                         except Exception:
                             pass
@@ -829,8 +960,10 @@ class ResponseBuilder:
         self.id = message_id
         self.names = names
         self.index = -1
-        self.open_kind = None      # "text" or "tool"
+        self.open_kind = None      # "text", "tool" or "thinking"
         self.tool = None
+        self.think_buf = []
+        self.think_sig = None
         self.blocks = []           # accumulated, for the non-streaming reply
         self.text_buf = []
         self.stop_reason = "end_turn"
@@ -845,6 +978,12 @@ class ResponseBuilder:
         if self.open_kind == "text":
             self.blocks.append({"type": "text", "text": "".join(self.text_buf)})
             self.text_buf = []
+        elif self.open_kind == "thinking":
+            self.blocks.append({"type": "thinking",
+                                "thinking": "".join(self.think_buf),
+                                "signature": self.think_sig or ""})
+            self.think_buf = []
+            self.think_sig = None
         else:
             raw = self.tool["json"]
             try:
@@ -869,6 +1008,18 @@ class ResponseBuilder:
             "content_block": {"type": "text", "text": ""}}))
         return out
 
+    def _open_thinking(self):
+        if self.open_kind == "thinking":
+            return []
+        out = self._close()
+        self.index += 1
+        self.open_kind = "thinking"
+        out.append(sse("content_block_start", {
+            "type": "content_block_start", "index": self.index,
+            "content_block": {"type": "thinking", "thinking": "",
+                              "signature": ""}}))
+        return out
+
     # -- events ---------------------------------------------------------
     def handle(self, kind, data):
         if kind in ("assistantResponseEvent", "") and "content" in data:
@@ -883,6 +1034,26 @@ class ResponseBuilder:
             out.append(sse("content_block_delta", {
                 "type": "content_block_delta", "index": self.index,
                 "delta": {"type": "text_delta", "text": text}}))
+            return out
+
+        if kind == "reasoningContentEvent":
+            # Kiro streams thinking as text deltas then one signature. The
+            # signature is what lets the block be replayed on the next turn.
+            out = []
+            text = data.get("text")
+            if text:
+                out.extend(self._open_thinking())
+                self.think_buf.append(text)
+                out.append(sse("content_block_delta", {
+                    "type": "content_block_delta", "index": self.index,
+                    "delta": {"type": "thinking_delta", "thinking": text}}))
+            sig = data.get("signature")
+            if sig:
+                out.extend(self._open_thinking())
+                self.think_sig = sig
+                out.append(sse("content_block_delta", {
+                    "type": "content_block_delta", "index": self.index,
+                    "delta": {"type": "signature_delta", "signature": sig}}))
             return out
 
         if kind == "toolUseEvent" or "toolUseId" in data or "name" in data:
@@ -938,7 +1109,8 @@ class ResponseBuilder:
         if not self.blocks:
             self.blocks.append({"type": "text", "text": ""})
         output_tokens = rough_tokens("".join(
-            b.get("text", "") or json.dumps(b.get("input", {})) for b in self.blocks))
+            b.get("text") or b.get("thinking") or json.dumps(b.get("input", {}))
+            for b in self.blocks))
         out.append(sse("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": self.stop_reason, "stop_sequence": None},
