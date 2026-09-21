@@ -112,6 +112,18 @@ def _log_target():
     global _log_fh
     if _log_fh is None and LOG_FILE:
         try:
+            # If stderr is already pointed at this same file (the PowerShell
+            # launcher does that with -RedirectStandardError), writing it a
+            # second time here would duplicate every line.
+            if os.path.exists(LOG_FILE):
+                try:
+                    a = os.fstat(sys.stderr.fileno())
+                    b = os.stat(LOG_FILE)
+                    if (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino):
+                        _log_fh = False
+                        return None
+                except Exception:
+                    pass
             if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 4 << 20:
                 prev = os.path.splitext(LOG_FILE)[0] + ".prev.log"
                 os.replace(LOG_FILE, prev)
