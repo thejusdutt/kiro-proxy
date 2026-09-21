@@ -83,15 +83,16 @@ EFFORT_DEFAULT = os.environ.get("KIRO_EFFORT", "high")
 VALID_EFFORT = ("low", "medium", "high", "xhigh", "max")
 
 MAX_TOOL_NAME = 64
-# Probed live 2026-09-21 against claude-opus-5. The window is far larger than
-# the old 600000 default assumed - that was reporting contextUsagePercentage
-# 15%, so it discarded most of the available context and trimmed constantly.
-# The real ceiling depends on how the content tokenizes: English prose ran to
-# 3.8MB at 92% usage, but source code (what actually fills a Claude Code
-# conversation) is denser and 3.1MB already returns
-# CONTENT_LENGTH_EXCEEDS_THRESHOLD, with 2.75MB at 94%. 2MB is the safe number
-# for code-heavy sessions and still more than three times the old cap.
-MAX_PAYLOAD_BYTES = int(os.environ.get("KIRO_MAX_PAYLOAD_BYTES", "2000000"))
+# Kiro's limit is a token count; this byte cap only approximates it, and the
+# approximation is poor. Probed live 2026-09-21 on claude-opus-5: real source
+# code ran 1.58MB at 54% context, English prose 3.8MB at 92%, but a file padded
+# with long runs of a single character hit 65% in just 691KB. So the cap is set
+# high enough that Claude Code's own compaction - which leaves a summary behind
+# - is what normally fires, and CONTENT_LENGTH_EXCEEDS_THRESHOLD is caught and
+# retried for the cases bytes fail to predict. Claude Code compacts around 80%
+# of its window; on a 1M model at typical code density that is roughly 2.5MB,
+# so the cap must sit above that or the proxy would always trim first.
+MAX_PAYLOAD_BYTES = int(os.environ.get("KIRO_MAX_PAYLOAD_BYTES", "2700000"))
 REQUEST_TIMEOUT = int(os.environ.get("KIRO_TIMEOUT", "600"))
 
 VERBOSE = False
@@ -697,30 +698,46 @@ def build_payload(body, names, conversation_id):
     # from the front. Doing this before the trim silently deleted Claude Code's
     # whole system prompt on every request over the size cap, which left Kiro's
     # own "I am Kiro, built by AWS" persona answering. Reserve keeps it whole.
+    fit_payload(payload, system_prompt)
+    return payload, model_id, system_prompt
+
+
+def fit_payload(payload, system_prompt, budget=None):
+    """Trim to fit, drop orphaned tool results, then add the system prompt.
+
+    Order matters. Kiro has no systemPrompt field (probed: it 400s in every
+    shape), so the prompt has to ride on the oldest user message - and the trim
+    deletes history from the front. Injecting before the trim silently deleted
+    Claude Code's whole system prompt on any request over the cap, which left
+    Kiro's own "I am Kiro, built by AWS" persona answering. Reserving its bytes
+    keeps a later injection from pushing the request back over.
+
+    Callable again on the same payload after a rejection, to trim harder.
+    """
     reserve = len(system_prompt.encode()) + 64 if system_prompt else 0
-    trim_payload(payload, reserve)
+    trimmed = trim_payload(payload, reserve, budget)
     prune_orphan_tool_results(payload)
 
     if system_prompt:
         state = payload["conversationState"]
         hist = state.get("history") or []
         if hist and "userInputMessage" in hist[0]:
-            first = hist[0]["userInputMessage"]
-            first["content"] = system_prompt + "\n\n" + first["content"]
+            target = hist[0]["userInputMessage"]
         else:
-            cur = state["currentMessage"]["userInputMessage"]
-            cur["content"] = system_prompt + "\n\n" + cur["content"]
-    return payload, model_id
+            target = state["currentMessage"]["userInputMessage"]
+        if not target.get("content", "").startswith(system_prompt):
+            target["content"] = system_prompt + "\n\n" + target["content"]
+    return trimmed
 
 
-def trim_payload(payload, reserve=0):
+def trim_payload(payload, reserve=0, budget=None):
     """Drop the oldest history pairs until the request fits Kiro's limit.
 
     `reserve` holds back room for bytes added after this runs (the system
     prompt), so injecting it later cannot push the request back over the cap.
     """
     state = payload["conversationState"]
-    budget = MAX_PAYLOAD_BYTES - reserve
+    budget = (MAX_PAYLOAD_BYTES if budget is None else budget) - reserve
     before = len(state.get("history", []))
     while len(json.dumps(state).encode()) > budget:
         history = state.get("history")
@@ -735,6 +752,7 @@ def trim_payload(payload, reserve=0):
             "turns are gone from this request" % (before - after, before, budget))
     vlog("payload %d bytes, %d history entries"
          % (len(json.dumps(state).encode()), after))
+    return before - after
 
 
 def _tool_use_ids(entry):
@@ -947,6 +965,22 @@ def kiro_headers(token):
     }
 
 
+# conversation id -> last contextUsagePercentage Kiro reported. Byte size is a
+# terrible predictor of Kiro's token limit: real source code ran 1.58MB at 54%
+# context, but a file padded with long runs of one character hit 65% in 691KB.
+# Feeding the previous turn's real usage back in beats guessing from bytes.
+CONTEXT_SEEN = {}
+
+
+def budget_for(convo):
+    """Byte budget for this conversation, tightened by what Kiro last reported."""
+    pct = CONTEXT_SEEN.get(convo)
+    if not pct or pct < 70:
+        return None                      # plenty of room, use the default cap
+    # Aim to land near 80% of the window at the density we actually observed.
+    return max(200000, int(MAX_PAYLOAD_BYTES * (80.0 / pct)))
+
+
 def call_kiro(creds, payload):
     token = creds.token()
     if creds.profile_arn:
@@ -1020,9 +1054,12 @@ class ResponseBuilder:
             self.blocks.append({"type": "text", "text": "".join(self.text_buf)})
             self.text_buf = []
         elif self.open_kind == "thinking":
-            self.blocks.append({"type": "thinking",
-                                "thinking": "".join(self.think_buf),
-                                "signature": self.think_sig or ""})
+            thought = "".join(self.think_buf)
+            # A thinking block with no text is noise; Kiro sometimes sends a
+            # signature with nothing in front of it.
+            if thought:
+                self.blocks.append({"type": "thinking", "thinking": thought,
+                                    "signature": self.think_sig or ""})
             self.think_buf = []
             self.think_sig = None
         else:
@@ -1033,7 +1070,8 @@ class ResponseBuilder:
                 args = {"_raw": raw}
             self.blocks.append({"type": "tool_use", "id": self.tool["id"],
                                 "name": self.tool["name"], "input": args})
-            self.stop_reason = "tool_use"
+            if self.stop_reason != "refusal":
+                self.stop_reason = "tool_use"
             self.tool = None
         self.open_kind = None
         return out
@@ -1099,6 +1137,28 @@ class ResponseBuilder:
 
         if kind == "toolUseEvent" or "toolUseId" in data or "name" in data:
             return self._tool_event(data)
+
+        if kind == "metadataEvent":
+            # Kiro can decline a conversation outright. It still returns 200
+            # with no content, so without this the client gets a blank message
+            # and no reason at all.
+            details = data.get("stopDetails") or {}
+            refusal = details.get("refusal") if isinstance(details, dict) else None
+            if isinstance(refusal, dict):
+                why = (refusal.get("explanation")
+                       or "Kiro declined to continue this conversation.")
+                cat = refusal.get("category")
+                text = "[kiro refusal%s] %s" % (
+                    " " + cat if cat else "", why)
+                log("refusal from kiro (%s): %s" % (cat, why))
+                out = self._open_text()
+                self.text_buf.append(text)
+                self.stop_reason = "refusal"
+                out.append(sse("content_block_delta", {
+                    "type": "content_block_delta", "index": self.index,
+                    "delta": {"type": "text_delta", "text": text}}))
+                return out
+            return []
 
         if kind == "contextUsageEvent":
             # Kiro reports true context usage; the Anthropic token counts this
@@ -1278,7 +1338,10 @@ class Handler(BaseHTTPRequestHandler):
         names = ToolNames()
         convo = hashlib.sha1(
             json.dumps(body.get("messages", [])[:1]).encode()).hexdigest()[:16]
-        payload, model_id = build_payload(body, names, convo)
+        payload, model_id, system_prompt = build_payload(body, names, convo)
+        budget = budget_for(convo)
+        if budget:
+            fit_payload(payload, system_prompt, budget)
         prompt_tokens = rough_tokens(json.dumps(payload))
         stream = bool(body.get("stream"))
         builder = ResponseBuilder(body.get("model") or model_id,
@@ -1288,7 +1351,30 @@ class Handler(BaseHTTPRequestHandler):
             % (model_id, body.get("model"), len(body.get("messages") or []),
                len(body.get("tools") or []), " stream" if stream else ""))
 
-        conn, resp = call_kiro(creds, payload)
+        # Kiro's real limit is tokens, not bytes, and how the content tokenizes
+        # varies far too much to predict from size alone. So when it says the
+        # content is too long, cut the oldest history and ask again rather than
+        # failing the turn. This is a backstop: at the default cap Claude Code's
+        # own compaction, which leaves a summary behind, gets there first.
+        conn = resp = None
+        for attempt in range(4):
+            try:
+                conn, resp = call_kiro(creds, payload)
+                break
+            except KiroError as e:
+                if ("CONTENT_LENGTH_EXCEEDS_THRESHOLD" not in e.detail
+                        or attempt == 3):
+                    raise
+                state = payload["conversationState"]
+                history = state.get("history") or []
+                if len(history) < 2:
+                    raise
+                shrunk = int(len(json.dumps(state).encode()) * 0.7)
+                cut = fit_payload(payload, system_prompt, shrunk)
+                log("kiro says content too long; dropped %d history entries "
+                    "and retrying (attempt %d)" % (cut, attempt + 2))
+                if not cut:
+                    raise
         decoder = EventStreamDecoder()
         headers_sent = False
 
@@ -1333,6 +1419,8 @@ class Handler(BaseHTTPRequestHandler):
             self._chunk(b"")   # terminating chunk
         else:
             self._json(200, builder.final_message(prompt_tokens, out_tokens))
+        if builder.context_pct is not None:
+            CONTEXT_SEEN[convo] = builder.context_pct
         used = ("" if builder.context_pct is None
                 else ", context %.1f%%" % builder.context_pct)
         log("<- %s, %d blocks, stop=%s%s"

@@ -140,6 +140,16 @@ claude
 
 `kiro-local` is only a placeholder that satisfies clients expecting an auth value. The proxy does not send it to Kiro. Kiro authentication comes from the local SQLite database.
 
+## Use the 1M context window
+
+Kiro serves roughly a million tokens of context on `claude-opus-5`, but Claude Code sizes its own compaction from the model name, and plain `claude-opus-5` is in its table as a 200K model. Ask for the 1M variant and it will use the larger threshold:
+
+```powershell
+claude --settings claude-kiro-settings.json --model "claude-opus-5[1m]"
+```
+
+The proxy maps `claude-opus-5[1m]` back to `claude-opus-5` before calling Kiro, which has no separate 1M model ID. Without the suffix Claude Code refuses large reads with "would overflow the context window" long before Kiro would.
+
 ## Select a model
 
 Use Claude Code's normal `/model` command with an exact Kiro model ID:
@@ -216,7 +226,7 @@ python kiroproxy.py [--host HOST] [--port PORT] [--db PATH] [--verbose]
 | `KIRO_DEFAULT_MODEL` | `claude-opus-5` | Fallback for unknown or absent model names |
 | `KIRO_SMALL_MODEL` | `claude-haiku-4.5` | Target for Haiku-style small-model requests |
 | `KIRO_TIMEOUT` | `600` | Kiro request timeout in seconds |
-| `KIRO_MAX_PAYLOAD_BYTES` | `2000000` | Payload target before old history pairs are removed |
+| `KIRO_MAX_PAYLOAD_BYTES` | `2700000` | Payload target before old history pairs are removed |
 | `KIRO_THINKING` | `adaptive` | `adaptive`, `disabled`, or `off` to send no thinking field at all |
 | `KIRO_EFFORT` | `high` | Reasoning effort: `low`, `medium`, `high`, `xhigh`, `max` |
 | `KIRO_LOG` | `proxy.log` beside the script | Log file; rotates to `proxy.prev.log` at 4 MB |
@@ -338,7 +348,8 @@ Kiro controls upstream throttling and output truncation. The proxy cannot recove
 - Kiro has no system-prompt field, so the system prompt is prepended to the oldest user message. It is injected after history trimming and its size is reserved in the trim budget, because trimming it away leaves Kiro's own assistant persona in charge of the turn.
 - Prompt caching needs no request fields: Kiro caches on content automatically, roughly halving the metered cost of a repeated prefix.
 - Extended thinking works on Claude 4.6 and newer and on GPT-5.6. Claude 4.5 and older, including the Haiku small model, reject `additionalModelRequestFields` outright, so nothing is sent for them.
-- Kiro's real limit is a token count, not a byte count, so `KIRO_MAX_PAYLOAD_BYTES` is only a proxy for it. Prose reached 3.8 MB at 92% context usage; source code is denser and exceeded the threshold at 3.1 MB. The 2 MB default is chosen for code-heavy sessions.
+- Kiro's real limit is a token count, not a byte count, and bytes predict it badly: source code ran 1.58 MB at 54% context usage, English prose 3.8 MB at 92%, but a file padded with long runs of one character reached 65% in 691 KB. `KIRO_MAX_PAYLOAD_BYTES` is therefore set high enough that Claude Code's own compaction normally fires first, and `CONTENT_LENGTH_EXCEEDS_THRESHOLD` is caught, trimmed and retried for whatever bytes fail to predict.
+- Kiro can refuse a conversation outright. It answers 200 with no content, so the refusal reason is surfaced as message text with `stop_reason: refusal` instead of an empty reply.
 - The model list is maintained in source and can lag behind Kiro rollouts.
 - Server-side Anthropic tools without a regular tool name are skipped.
 - Long-history trimming can produce `TOOL_USE_RESULT_MISMATCH`; see troubleshooting above.
