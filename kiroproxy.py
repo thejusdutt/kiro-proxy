@@ -60,9 +60,12 @@ MODEL_MAP = {
     "sonnet": "claude-sonnet-5",
     "haiku": "claude-haiku-4.5",
 }
-# Probed against the live API on 2026-09-20: opus-5 / sonnet-5 / opus-4.8 all
-# answer; there is no 1M-context variant id - claude-opus-5[1m] and friends
-# come back INVALID_MODEL_ID. haiku-5 does not exist on Kiro either.
+# Taken from AmazonCodeWhispererService.ListAvailableModels on
+# management.{region}.kiro.dev (2026-09-21), which is the authoritative list
+# for THIS account - another licence or region may differ, so re-read it there
+# rather than editing this by guesswork. There is no 1M-context variant id:
+# claude-opus-5[1m] is INVALID_MODEL_ID upstream and the suffix is stripped
+# before the call. haiku-5 and Fable do not exist on Kiro at all.
 KNOWN_MODELS = [
     "auto",
     "claude-opus-5", "claude-sonnet-5",
@@ -70,7 +73,7 @@ KNOWN_MODELS = [
     "claude-sonnet-4.6", "claude-sonnet-4.5", "claude-sonnet-4",
     "claude-haiku-4.5",
     "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
-    "glm-5", "minimax-m2.5", "minimax-m2.1", "deepseek-3.2", "qwen3-coder-next",
+    "minimax-m2.5", "minimax-m2.1", "qwen3-coder-next",
 ]
 DEFAULT_MODEL = os.environ.get("KIRO_DEFAULT_MODEL", "claude-opus-5")
 SMALL_MODEL = os.environ.get("KIRO_SMALL_MODEL", "claude-haiku-4.5")
