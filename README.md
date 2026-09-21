@@ -216,7 +216,10 @@ python kiroproxy.py [--host HOST] [--port PORT] [--db PATH] [--verbose]
 | `KIRO_DEFAULT_MODEL` | `claude-opus-5` | Fallback for unknown or absent model names |
 | `KIRO_SMALL_MODEL` | `claude-haiku-4.5` | Target for Haiku-style small-model requests |
 | `KIRO_TIMEOUT` | `600` | Kiro request timeout in seconds |
-| `KIRO_MAX_PAYLOAD_BYTES` | `600000` | Payload target before old history pairs are removed |
+| `KIRO_MAX_PAYLOAD_BYTES` | `3000000` | Payload target before old history pairs are removed |
+| `KIRO_THINKING` | `adaptive` | `adaptive`, `disabled`, or `off` to send no thinking field at all |
+| `KIRO_EFFORT` | `high` | Reasoning effort: `low`, `medium`, `high`, `xhigh`, `max` |
+| `KIRO_LOG` | `proxy.log` beside the script | Log file; rotates to `proxy.prev.log` at 4 MB |
 
 The Windows launcher has port `9100` written into `claude-kiro.cmd`. If you change the server port, update the launcher and `ANTHROPIC_BASE_URL` in `claude-kiro-settings.json` too.
 
@@ -264,7 +267,8 @@ The server also accepts query strings used by Claude Code, such as `/v1/messages
 - Base64 PNG, JPEG, GIF, and WebP images are forwarded.
 - `thinking` and `redacted_thinking` blocks are omitted because Kiro does not expose compatible reasoning blocks.
 - Unknown content blocks are converted to text rather than rejected locally.
-- Older history pairs are removed when the translated payload grows beyond `KIRO_MAX_PAYLOAD_BYTES`.
+- Older history pairs are removed when the translated payload grows beyond `KIRO_MAX_PAYLOAD_BYTES`. Unlike Claude Code's own compaction this leaves no summary behind, so the trim is logged as a warning.
+- Thinking arrives as Kiro `reasoningContentEvent` frames and is re-emitted as Anthropic `thinking` blocks with `thinking_delta` and `signature_delta`. Signed blocks are replayed to Kiro on later turns as `assistantResponseMessage.reasoningContent`.
 
 ## Security notes
 
@@ -331,8 +335,9 @@ Kiro controls upstream throttling and output truncation. The proxy cannot recove
 ## Known limits
 
 - Token counts are estimates (`text length / 4`), so Claude Code's context meter is approximate.
-- Prompt caching fields are accepted but do not create Anthropic prompt-cache behavior.
-- Extended-thinking requests are accepted, but compatible thinking blocks are not returned.
+- Kiro has no system-prompt field, so the system prompt is prepended to the oldest user message. It is injected after history trimming and its size is reserved in the trim budget, because trimming it away leaves Kiro's own assistant persona in charge of the turn.
+- Prompt caching needs no request fields: Kiro caches on content automatically, roughly halving the metered cost of a repeated prefix.
+- Extended thinking works on Claude 4.6 and newer and on GPT-5.6. Claude 4.5 and older, including the Haiku small model, reject `additionalModelRequestFields` outright, so nothing is sent for them.
 - The model list is maintained in source and can lag behind Kiro rollouts.
 - Server-side Anthropic tools without a regular tool name are skipped.
 - Long-history trimming can produce `TOOL_USE_RESULT_MISMATCH`; see troubleshooting above.

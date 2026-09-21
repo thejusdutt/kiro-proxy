@@ -83,7 +83,12 @@ EFFORT_DEFAULT = os.environ.get("KIRO_EFFORT", "high")
 VALID_EFFORT = ("low", "medium", "high", "xhigh", "max")
 
 MAX_TOOL_NAME = 64
-MAX_PAYLOAD_BYTES = int(os.environ.get("KIRO_MAX_PAYLOAD_BYTES", "600000"))
+# Probed live 2026-09-21 against claude-opus-5: 3.8MB of payload reports
+# contextUsagePercentage 92.2, so the real window is ~4.1MB (~1M tokens) even
+# though there is no [1m] model id. The old 600000 default was reporting 15%
+# usage - it was discarding roughly six sevenths of the available context and
+# firing the history trim constantly. 3MB sits at ~73% with room to spare.
+MAX_PAYLOAD_BYTES = int(os.environ.get("KIRO_MAX_PAYLOAD_BYTES", "3000000"))
 REQUEST_TIMEOUT = int(os.environ.get("KIRO_TIMEOUT", "600"))
 
 VERBOSE = False
@@ -472,14 +477,33 @@ def extract_reasoning(content):
     return {"reasoningText": {"text": "".join(text), "signature": signature}}
 
 
-def model_request_fields(body):
+# Which models accept additionalModelRequestFields, and in which dialect.
+# Probed live 2026-09-21: claude 4.6+/5 take thinking + output_config.effort;
+# gpt-5.6 takes reasoning.effort; claude 4.5 and below (including the haiku
+# small-model Claude Code uses for titles) reject the field outright with
+# "additionalModelRequestFields is not supported for this model".
+def effort_dialect(model_id):
+    m = (model_id or "").lower()
+    if m.startswith("gpt-"):
+        return "reasoning"
+    if m.startswith("claude-"):
+        try:
+            version = float(m.split("-")[2])
+        except (IndexError, ValueError):
+            return None
+        return "output_config" if version >= 4.6 else None
+    return None
+
+
+def model_request_fields(body, model_id):
     """additionalModelRequestFields from what Claude Code asked for.
 
     Claude Code sends `thinking` as {"type": "enabled", "budget_tokens": N}.
     Kiro has no budget knob - it takes "adaptive" or "disabled" plus a coarse
     effort level - so the budget is mapped onto an effort instead.
     """
-    if THINKING_DEFAULT == "off":
+    dialect = effort_dialect(model_id)
+    if THINKING_DEFAULT == "off" or not dialect:
         return None
 
     asked = body.get("thinking")
@@ -505,6 +529,9 @@ def model_request_fields(body):
     cfg = body.get("output_config")
     if isinstance(cfg, dict) and cfg.get("effort") in VALID_EFFORT:
         effort = cfg["effort"]
+
+    if dialect == "reasoning":          # gpt-5.6 has no thinking toggle
+        return {"reasoning": {"effort": effort}} if effort in VALID_EFFORT else None
 
     fields = {"thinking": {"type": mode}}
     if effort in VALID_EFFORT:
@@ -649,7 +676,7 @@ def build_payload(body, names, conversation_id):
     if context:
         user_message["userInputMessageContext"] = context
 
-    fields = model_request_fields(body)
+    fields = model_request_fields(body, model_id)
 
     payload = {"conversationState": {
         "chatTriggerType": "MANUAL",
@@ -932,6 +959,16 @@ def call_kiro(creds, payload):
             return conn, resp
         detail = resp.read()[:2000].decode("utf-8", "replace")
         conn.close()
+        if (resp.status == 400 and attempt == 1
+                and "additionalModelRequestFields" in detail
+                and "additionalModelRequestFields" in payload):
+            # A model Kiro does not offer thinking on. Drop it and go again
+            # rather than failing the turn.
+            log("model rejected additionalModelRequestFields, retrying without it")
+            payload = {k: v for k, v in payload.items()
+                       if k != "additionalModelRequestFields"}
+            body = json.dumps(payload).encode()
+            continue
         if resp.status in (401, 403) and attempt == 1:
             log("auth rejected (%s), forcing refresh" % resp.status)
             with creds._lock:
