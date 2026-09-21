@@ -83,12 +83,15 @@ EFFORT_DEFAULT = os.environ.get("KIRO_EFFORT", "high")
 VALID_EFFORT = ("low", "medium", "high", "xhigh", "max")
 
 MAX_TOOL_NAME = 64
-# Probed live 2026-09-21 against claude-opus-5: 3.8MB of payload reports
-# contextUsagePercentage 92.2, so the real window is ~4.1MB (~1M tokens) even
-# though there is no [1m] model id. The old 600000 default was reporting 15%
-# usage - it was discarding roughly six sevenths of the available context and
-# firing the history trim constantly. 3MB sits at ~73% with room to spare.
-MAX_PAYLOAD_BYTES = int(os.environ.get("KIRO_MAX_PAYLOAD_BYTES", "3000000"))
+# Probed live 2026-09-21 against claude-opus-5. The window is far larger than
+# the old 600000 default assumed - that was reporting contextUsagePercentage
+# 15%, so it discarded most of the available context and trimmed constantly.
+# The real ceiling depends on how the content tokenizes: English prose ran to
+# 3.8MB at 92% usage, but source code (what actually fills a Claude Code
+# conversation) is denser and 3.1MB already returns
+# CONTENT_LENGTH_EXCEEDS_THRESHOLD, with 2.75MB at 94%. 2MB is the safe number
+# for code-heavy sessions and still more than three times the old cap.
+MAX_PAYLOAD_BYTES = int(os.environ.get("KIRO_MAX_PAYLOAD_BYTES", "2000000"))
 REQUEST_TIMEOUT = int(os.environ.get("KIRO_TIMEOUT", "600"))
 
 VERBOSE = False
@@ -1001,6 +1004,7 @@ class ResponseBuilder:
         self.tool = None
         self.think_buf = []
         self.think_sig = None
+        self.context_pct = None
         self.blocks = []           # accumulated, for the non-streaming reply
         self.text_buf = []
         self.stop_reason = "end_turn"
@@ -1095,6 +1099,14 @@ class ResponseBuilder:
 
         if kind == "toolUseEvent" or "toolUseId" in data or "name" in data:
             return self._tool_event(data)
+
+        if kind == "contextUsageEvent":
+            # Kiro reports true context usage; the Anthropic token counts this
+            # proxy returns are a length/4 guess, so log the real number.
+            pct = data.get("contextUsagePercentage")
+            if isinstance(pct, (int, float)):
+                self.context_pct = pct
+            return []
 
         if kind == "exception":
             raise KiroError(400, json.dumps(data))
@@ -1321,8 +1333,10 @@ class Handler(BaseHTTPRequestHandler):
             self._chunk(b"")   # terminating chunk
         else:
             self._json(200, builder.final_message(prompt_tokens, out_tokens))
-        log("<- %s, %d blocks, stop=%s"
-            % (model_id, len(builder.blocks), builder.stop_reason))
+        used = ("" if builder.context_pct is None
+                else ", context %.1f%%" % builder.context_pct)
+        log("<- %s, %d blocks, stop=%s%s"
+            % (model_id, len(builder.blocks), builder.stop_reason, used))
 
     def _chunk(self, data):
         self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
