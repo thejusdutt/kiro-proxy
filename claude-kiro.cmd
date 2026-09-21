@@ -10,7 +10,7 @@ powershell -NoProfile -Command "if (-not (Test-NetConnection -ComputerName 127.0
 set "CLAUDE_CODE_USE_BEDROCK="
 set "ANTHROPIC_BASE_URL=http://127.0.0.1:%PORT%"
 set "ANTHROPIC_AUTH_TOKEN=kiro-local"
-set "ANTHROPIC_MODEL=claude-opus-5"
+set "ANTHROPIC_MODEL=claude-opus-5[1m]"
 set "ANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4-5-20251001"
 
 claude --settings "%DIR%claude-kiro-settings.json" %*

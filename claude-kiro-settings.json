@@ -3,9 +3,9 @@
     "CLAUDE_CODE_USE_BEDROCK": "",
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:9100",
     "ANTHROPIC_AUTH_TOKEN": "kiro-local",
-    "ANTHROPIC_MODEL": "claude-opus-5",
+    "ANTHROPIC_MODEL": "claude-opus-5[1m]",
     "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-4-5-20251001",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
   },
-  "model": "claude-opus-5"
+  "model": "claude-opus-5[1m]"
 }

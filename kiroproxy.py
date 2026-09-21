@@ -975,10 +975,17 @@ CONTEXT_SEEN = {}
 def budget_for(convo):
     """Byte budget for this conversation, tightened by what Kiro last reported."""
     pct = CONTEXT_SEEN.get(convo)
-    if not pct or pct < 70:
+    if not pct or pct < 80:
         return None                      # plenty of room, use the default cap
     # Aim to land near 80% of the window at the density we actually observed.
-    return max(200000, int(MAX_PAYLOAD_BYTES * (80.0 / pct)))
+    return max(200000, min(MAX_PAYLOAD_BYTES, int(MAX_PAYLOAD_BYTES * (80.0 / pct))))
+
+
+def remember_context(convo, pct):
+    """Keep the last reading per conversation, bounded so it cannot grow forever."""
+    CONTEXT_SEEN[convo] = pct
+    while len(CONTEXT_SEEN) > 200:
+        CONTEXT_SEEN.pop(next(iter(CONTEXT_SEEN)))
 
 
 def call_kiro(creds, payload):
@@ -1420,7 +1427,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(200, builder.final_message(prompt_tokens, out_tokens))
         if builder.context_pct is not None:
-            CONTEXT_SEEN[convo] = builder.context_pct
+            remember_context(convo, builder.context_pct)
         used = ("" if builder.context_pct is None
                 else ", context %.1f%%" % builder.context_pct)
         log("<- %s, %d blocks, stop=%s%s"
