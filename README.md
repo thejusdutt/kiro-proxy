@@ -1,18 +1,31 @@
-# Kiro Proxy
+# Kiro Proxy: use Claude Code with your Kiro subscription
 
-Run Claude Code against the models available in your Kiro subscription.
+**Run [Claude Code](https://code.claude.com) on a [Kiro](https://kiro.dev) plan. No Anthropic API key needed.** Claude Opus 5, Sonnet 5, GPT-5.6, Qwen3 Coder and MiniMax all work, with 1M context, streaming, tool use and extended thinking.
 
-Kiro Proxy is a small, dependency-free Python server that presents the parts of the Anthropic Messages API used by Claude Code, translates each request into Kiro's `generateAssistantResponse` format, and translates Kiro's event stream back into Anthropic-compatible responses.
+![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue)
+![Dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen)
+![Single file](https://img.shields.io/badge/single%20file-kiroproxy.py-lightgrey)
+![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-informational)
 
-- One Python file
-- Python standard library only
-- Streaming, tool use, images, and multi-turn history
-- Automatic Kiro access-token refresh
-- Windows launcher included
-- Model switching from Claude Code with `/model`
+Kiro Proxy is a small Python server with no dependencies. It speaks the Anthropic Messages API (`/v1/messages`) to Claude Code and forwards each request to Kiro's `generateAssistantResponse` backend. Kiro's AWS event stream comes back to Claude Code as Anthropic-style SSE. If you already pay for Kiro, this lets you use the Claude Code CLI with that plan's models and credits.
+
+```bash
+kiro-cli login
+python kiroproxy.py
+ANTHROPIC_BASE_URL=http://127.0.0.1:9100 ANTHROPIC_AUTH_TOKEN=kiro-local claude
+```
+
+- **One Python file.** Uses only the standard library, so there's no pip, venv or Docker.
+- **Full Claude Code support.** Streaming, tool use, images, multi-turn history, and extended thinking with signatures.
+- **1M context window** on `claude-opus-5[1m]`.
+- **Switch models with `/model`.** Claude, GPT-5.6, Qwen3 Coder and MiniMax through one endpoint.
+- **Token refresh is automatic.** It reuses the `kiro-cli login` credentials in place and never copies them.
+- **Runs on Windows, macOS and Linux.** A one-click Windows launcher is included.
 
 > [!NOTE]
-> This is an unofficial compatibility proxy. It is not an Anthropic API server and does not call Anthropic. Requests go from your machine to Kiro using the credentials created by Kiro CLI.
+> This is an unofficial compatibility proxy. It is not affiliated with Anthropic, AWS or Kiro, and it never calls Anthropic. Requests go from your machine to Kiro with the credentials Kiro CLI created. Your usage is governed by your Kiro plan and its terms.
+
+**Contents:** [How it works](#how-it-works) · [Requirements](#requirements) · [Quick start](#quick-start-on-windows) · [macOS / Linux](#manual-setup) · [1M context](#use-the-1m-context-window) · [Models](#select-a-model) · [Configuration](#configuration) · [Troubleshooting](#troubleshooting) · [FAQ](#faq)
 
 ## How it works
 
@@ -64,8 +77,6 @@ You only need to repeat this when the Kiro refresh token expires or is revoked.
 git clone https://github.com/thejusdutt/kiro-proxy.git
 cd kiro-proxy
 ```
-
-The repository is private, so GitHub authentication is required.
 
 ### 3. Launch Claude Code
 
@@ -167,9 +178,9 @@ The proxy currently recognizes these IDs:
 | Claude Sonnet | `claude-sonnet-5`, `claude-sonnet-4.6`, `claude-sonnet-4.5`, `claude-sonnet-4` |
 | Claude Haiku | `claude-haiku-4.5` |
 | GPT | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` |
-| Other | `glm-5`, `minimax-m2.5`, `minimax-m2.1`, `deepseek-3.2`, `qwen3-coder-next` |
+| Other | `qwen3-coder-next`, `minimax-m2.5`, `minimax-m2.1` |
 
-Model availability depends on the Kiro account, plan, region, and rollout. The list above is static; `GET /v1/models` reports the same configured list rather than querying Kiro live.
+Model availability depends on the Kiro account, plan, region, and rollout. The list above was taken from Kiro's `ListAvailableModels` on 2026-09-21 and is static; `GET /v1/models` reports the same configured list rather than querying Kiro live.
 
 For GPT-5.6, Kiro describes the tiers as:
 
@@ -200,7 +211,7 @@ Claude Code may display the requested or environment-selected label rather than 
 
 ### Change the default model
 
-`claude-kiro.cmd` sets `ANTHROPIC_MODEL=claude-opus-5`, so new launcher sessions start on Opus even if Claude Code previously saved another `/model` choice. To make another model permanent, update `ANTHROPIC_MODEL` in both:
+`claude-kiro.cmd` sets `ANTHROPIC_MODEL=claude-opus-5[1m]`, so new launcher sessions start on Opus even if Claude Code previously saved another `/model` choice. To make another model permanent, update `ANTHROPIC_MODEL` in both:
 
 - `claude-kiro.cmd`
 - `claude-kiro-settings.json`
@@ -326,7 +337,7 @@ Read the proxy's foreground output before signing in again. An error shown by Cl
 
 ### Long sessions fail after many tool calls
 
-The proxy removes old history in pairs after the translated payload exceeds 600KB. A cut can occasionally leave an old tool result without its matching tool call, and Kiro then returns `TOOL_USE_RESULT_MISMATCH`. `/clear` or a new session is the current workaround.
+The proxy removes old history in pairs after the translated payload exceeds `KIRO_MAX_PAYLOAD_BYTES` (2.7 MB by default). A cut can occasionally leave an old tool result without its matching tool call, and Kiro then returns `TOOL_USE_RESULT_MISMATCH`. `/clear` or a new session is the current workaround.
 
 ### Port 9100 is already in use
 
@@ -354,6 +365,40 @@ Kiro controls upstream throttling and output truncation. The proxy cannot recove
 - Server-side Anthropic tools without a regular tool name are skipped.
 - Long-history trimming can produce `TOOL_USE_RESULT_MISMATCH`; see troubleshooting above.
 - Compatibility is aimed at Claude Code's use of the Messages API, not every Anthropic API feature.
+
+## FAQ
+
+### Can I use Claude Code with a Kiro subscription?
+
+Yes. Start `kiroproxy.py`, set `ANTHROPIC_BASE_URL=http://127.0.0.1:9100`, and Claude Code sends its requests to Kiro instead of Anthropic. Any model on your Kiro plan can serve them.
+
+### Do I need an Anthropic API key or a Claude Pro/Max plan?
+
+No. `ANTHROPIC_AUTH_TOKEN=kiro-local` is a placeholder the proxy ignores. Authentication comes from your `kiro-cli login`.
+
+### Can I use GPT-5.6 or Qwen3 Coder inside Claude Code?
+
+Yes, if your Kiro plan has access. Run `/model gpt-5.6-sol`, `/model gpt-5.6-terra`, `/model gpt-5.6-luna` or `/model qwen3-coder-next` in Claude Code.
+
+### Does it support the 1M-token context window?
+
+Yes. Use `--model "claude-opus-5[1m]"` so Claude Code sizes its compaction for 1M tokens. See [Use the 1M context window](#use-the-1m-context-window).
+
+### Does extended thinking work?
+
+Yes, on Claude 4.6 and newer and on GPT-5.6. Kiro's reasoning events are re-emitted as Anthropic `thinking` blocks with signatures. Set the effort with `KIRO_EFFORT`.
+
+### Does it work on macOS and Linux?
+
+Yes. The server is plain Python. Only the `claude-kiro.cmd` launcher is Windows-specific. On macOS and Linux, use the [Bash setup](#bash).
+
+### Is this the same as Kiro CLI or Kiro IDE?
+
+No. Kiro CLI and the Kiro IDE are Kiro's own clients. This proxy lets Claude Code act as the client and still uses your Kiro account.
+
+### Can other tools that speak the Anthropic API use it?
+
+Probably, as long as they use `/v1/messages`. The proxy is built and tested against Claude Code, so other clients may call features it doesn't cover.
 
 ## Development checks
 
